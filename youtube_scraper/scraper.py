@@ -56,7 +56,7 @@ class YouTubeScraper:
         self.use_proxy_rotation = use_proxy_rotation
         self.sleep_interval = sleep_interval
         self.stats = ScrapingStats(
-            start_time=datetime.now(),
+            start_time=datetime.now().isoformat(),
             end_time=None,
             total_items=0,
             processed_items=0,
@@ -116,10 +116,20 @@ class YouTubeScraper:
         self._setup_yt_dlp()
         
     def _setup_yt_dlp(self):
+        """Set up yt-dlp options."""
         self.yt_opts = {
             'quiet': True,
             'no_warnings': True,
-            'extract_flat': True
+            'extract_flat': True,
+            'writesubtitles': False,
+            'getcomments': True,  # Enable comment extraction
+            'extractor_args': {
+                'youtube': {
+                    'skip': ['dash', 'hls'],
+                    'comment_download': ['1'],  # Force comment download
+                    'max_comments': ['all'],  # Get all comments by default
+                }
+            }
         }
         
         if self.cookies_file:
@@ -156,6 +166,7 @@ class YouTubeScraper:
         return headers
         
     async def _get_proxy(self):
+        """Get a working proxy from the pool."""
         current_time = time.time()
         if not self.proxy_pool or (current_time - self.last_proxy_refresh) > self.proxy_refresh_interval:
             try:
@@ -169,22 +180,45 @@ class YouTubeScraper:
                     
                     for source in sources:
                         try:
-                            async with session.get(source) as response:
+                            async with session.get(source, timeout=10) as response:
                                 if response.status == 200:
                                     text = await response.text()
                                     proxies = [f'http://{proxy.strip()}' for proxy in text.split('\n') if proxy.strip()]
                                     self.proxy_pool.extend(proxies)
                         except Exception as e:
-                            logging.warning(f"Failed to fetch proxies from {source}: {str(e)}")
+                            logger.warning(f"Failed to fetch proxies from {source}: {str(e)}")
+                            continue
                             
                     self.last_proxy_refresh = current_time
             except Exception as e:
-                logging.error(f"Error refreshing proxy pool: {str(e)}")
+                logger.error(f"Error refreshing proxy pool: {str(e)}")
                 
         if not self.proxy_pool:
+            logger.warning("No proxies available, proceeding without proxy")
             return None
             
-        return random.choice(self.proxy_pool)
+        # Try proxies until we find a working one
+        max_tries = min(5, len(self.proxy_pool))
+        for _ in range(max_tries):
+            proxy = random.choice(self.proxy_pool)
+            try:
+                # Test the proxy with a quick request
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        'https://www.youtube.com',
+                        proxy=proxy,
+                        timeout=5,
+                        ssl=False
+                    ) as response:
+                        if response.status == 200:
+                            return proxy
+            except Exception:
+                self.proxy_pool.remove(proxy)
+                continue
+                
+        # If no working proxy found, try without proxy
+        logger.warning("No working proxies found, proceeding without proxy")
+        return None
         
     def _handle_rate_limit(self, retry_count):
         """Implement exponential backoff with jitter"""
@@ -263,95 +297,123 @@ class YouTubeScraper:
             raise e
             
     async def scrape_video(self, url: str) -> Optional[VideoMetadata]:
-        """Scrape metadata from a YouTube video with improved error handling."""
-        video_id = extract_video_id(url)
-        if not video_id:
-            logger.error(f"Invalid video URL: {url}")
-            return None
-
+        """Scrape video metadata."""
         try:
-            self.stats.total_requests += 1
-            info = await self._make_request(url)
-            if not info:
-                return None
-                
-            video = VideoMetadata(
-                video_id=video_id,
-                title=info["title"],
-                description=info.get("description"),
-                upload_date=parse_date(info["upload_date"]),
-                view_count=info["view_count"],
-                like_count=info.get("like_count"),
-                comment_count=info.get("comment_count"),
-                duration=info["duration"],
-                tags=info.get("tags", []),
-                thumbnail_url=info["thumbnail"],
-                channel_id=info["channel_id"],
-                channel_title=info["channel"],
-            )
-            self.stats.success_count += 1
-            return video
-        except Exception as e:
-            logger.error(f"Failed to scrape video {url}: {e}")
-            self.stats.error_count += 1
-            return None
+            video_id = extract_video_id(url)
+            if not video_id:
+                raise ValueError(f"Invalid video URL: {url}")
 
-    async def scrape_comments(
-        self,
-        url: str,
-        max_comments: Optional[int] = None,
-        include_replies: bool = True,
-    ) -> List[Comment]:
-        """Scrape comments from a YouTube video."""
-        video_id = extract_video_id(url)
-        if not video_id:
-            logger.error(f"Invalid video URL: {url}")
-            return []
-
-        comments = []
-        try:
-            self.stats.total_requests += 1
+            # Use yt-dlp to extract video info
             with yt_dlp.YoutubeDL(self.yt_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                
-                if "comments" not in info:
-                    logger.warning(f"No comments found for video {url}")
-                    return []
-
-                for comment_data in info["comments"][:max_comments]:
-                    comment = Comment(
-                        comment_id=comment_data["id"],
-                        text=comment_data["text"],
-                        author=comment_data["author"],
-                        author_channel_id=comment_data.get("author_id"),
-                        like_count=comment_data.get("like_count", 0),
-                        reply_count=comment_data.get("reply_count", 0),
-                        published_at=parse_date(comment_data["timestamp"]),
-                        updated_at=None,
-                        is_reply=False,
+                try:
+                    info = ydl.extract_info(url, download=False)
+                    
+                    # Create VideoMetadata object
+                    video_data = VideoMetadata(
+                        video_id=video_id,
+                        title=info.get('title', ''),
+                        description=info.get('description', ''),
+                        upload_date=info.get('upload_date', ''),
+                        duration=info.get('duration', 0),
+                        view_count=info.get('view_count', 0),
+                        like_count=info.get('like_count', 0),
+                        comment_count=info.get('comment_count', 0),
+                        channel=info.get('uploader', ''),
+                        channel_id=info.get('channel_id', ''),
+                        tags=info.get('tags', []),
+                        categories=info.get('categories', [])
                     )
-                    comments.append(comment)
-
-                    if include_replies and comment_data.get("replies"):
-                        for reply in comment_data["replies"]:
-                            reply_comment = Comment(
-                                comment_id=reply["id"],
-                                text=reply["text"],
-                                author=reply["author"],
-                                author_channel_id=reply.get("author_id"),
-                                like_count=reply.get("like_count", 0),
-                                reply_count=0,
-                                published_at=parse_date(reply["timestamp"]),
-                                updated_at=None,
-                                is_reply=True,
-                                parent_id=comment.comment_id,
-                            )
-                            comments.append(reply_comment)
-
-                self.stats.success_count += 1
-                return comments
+                    
+                    self.stats.success_count += 1
+                    return video_data
+                    
+                except Exception as e:
+                    logger.error(f"Failed to extract video info: {str(e)}")
+                    self.stats.error_count += 1
+                    raise
+                    
         except Exception as e:
-            logger.error(f"Failed to scrape comments for video {url}: {e}")
+            logger.error(f"Failed to scrape video {url}: {str(e)}")
+            self.stats.error_count += 1
+            raise
+
+    async def scrape_comments(self, url: str, max_comments: Optional[int] = None) -> List[Comment]:
+        """Scrape video comments."""
+        try:
+            video_id = extract_video_id(url)
+            if not video_id:
+                raise ValueError(f"Invalid video URL: {url}")
+
+            # Use yt-dlp to extract comments
+            comments_opts = {
+                **self.yt_opts,
+                'extract_flat': False,
+                'getcomments': True,
+                'quiet': True,
+                'extractor_args': {
+                    'youtube': {
+                        'comment_download': ['1'],
+                        'max_comments': [str(max_comments if max_comments else 'all')]
+                    }
+                }
+            }
+
+            with yt_dlp.YoutubeDL(comments_opts) as ydl:
+                try:
+                    info = ydl.extract_info(url, download=False)
+                    comments_info = info.get('comments', [])
+                    
+                    if not comments_info:
+                        logger.warning(f"No comments found for video {url}")
+                        return []
+                    
+                    comments = []
+                    for comment in comments_info:
+                        try:
+                            # Handle potential None values
+                            like_count = comment.get('like_count')
+                            like_count = int(like_count) if like_count is not None else 0
+                            
+                            reply_count = comment.get('reply_count')
+                            reply_count = int(reply_count) if reply_count is not None else 0
+                            
+                            # Convert timestamp to ISO format string
+                            timestamp = comment.get('timestamp')
+                            if isinstance(timestamp, (int, float)):
+                                from datetime import datetime
+                                timestamp = datetime.fromtimestamp(timestamp).isoformat()
+                            elif timestamp is None:
+                                timestamp = ''
+                            
+                            comment_obj = Comment(
+                                comment_id=comment.get('id', ''),
+                                text=comment.get('text', ''),
+                                author=comment.get('author', ''),
+                                author_id=comment.get('author_id', ''),
+                                like_count=like_count,
+                                reply_count=reply_count,
+                                time=timestamp
+                            )
+                            comments.append(comment_obj)
+                            
+                            if max_comments and len(comments) >= max_comments:
+                                break
+                                
+                        except Exception as e:
+                            logger.warning(f"Failed to parse comment: {str(e)}")
+                            continue
+
+                    self.stats.success_count += 1
+                    logger.info(f"Successfully scraped {len(comments)} comments")
+                    return comments
+                    
+                except Exception as e:
+                    logger.error(f"Failed to extract comments: {str(e)}")
+                    self.stats.error_count += 1
+                    return []
+                    
+        except Exception as e:
+            logger.error(f"Failed to scrape comments for {url}: {str(e)}")
             self.stats.error_count += 1
             return []
 
@@ -611,8 +673,7 @@ class YouTubeScraper:
                                         description=entry.get("description", ""),
                                         video_count=entry.get("video_count", 0),
                                         view_count=entry.get("view_count", 0),
-                                        last_updated=datetime.now(),  # Use current time as fallback
-                                        channel_id=entry.get("channel_id", ""),
+                                        channel_id=entry.get("channel_id", "")
                                     )
                                     playlists.append(playlist)
                                 except Exception as e:
@@ -686,7 +747,7 @@ class YouTubeScraper:
 
     def get_stats(self) -> Dict:
         """Get current scraping statistics."""
-        self.stats.end_time = datetime.now()
+        self.stats.update_end_time()
         return self.stats.dict()
 
     async def close(self):
